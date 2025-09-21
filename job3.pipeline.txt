@@ -1,0 +1,33 @@
+pipeline {
+  agent any
+  parameters {
+    string(name: 'TEST_IP', defaultValue: '', description: 'IP of the test server')
+  }
+  stages {
+    stage('Build & Deploy Docker Container') {
+      steps {
+        sh """
+          ssh-keygen -f "/var/lib/jenkins/.ssh/known_hosts" -R "${params.TEST_IP}" || true
+
+          ssh -o StrictHostKeyChecking=no -i /var/lib/jenkins/.ssh/id_rsa jenkins@${params.TEST_IP} <<'REMOTE'
+          set -e
+          rm -rf /tmp/projCert || true
+          git clone https://github.com/srinish/projCert.git /tmp/projCert
+          cd /tmp/projCert
+          sudo docker build -t applebite-app:latest .
+          sudo docker rm -f applebite || true
+          sudo docker run -d --name applebite -p 80:80 applebite-app:latest
+REMOTE
+        """
+      }
+    }
+  }
+  post {
+    failure {
+      echo "Triggering Job 4: Cleanup Container on Failure"
+      build job: 'Job4-Cleanup-Container-on-Failure', wait: false, parameters: [
+        string(name: 'TEST_IP', value: params.TEST_IP)
+      ]
+    }
+  }
+}
