@@ -1,0 +1,51 @@
+pipeline {
+    agent any
+    environment {
+        PROJECT = "devopscertification-472014"   // GCP project
+        GCP_SA_CRED = "gcp-sa-key"              // Jenkins GCP service account secret
+    }
+    parameters {
+        string(name: 'TEST_IP', defaultValue: '', description: 'Public IP of the test server to delete')
+    }
+    stages {
+        stage('Delete Test Server by IP') {
+            steps {
+                script {
+                    if (!params.TEST_IP?.trim()) {
+                        error("TEST_IP parameter is empty. Cannot proceed.")
+                    }
+
+                    withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GCP_SA_JSON')]) {
+                        sh """
+                        #!/bin/bash
+                        set -euo
+
+                        echo "Authenticating to GCP..."
+                        gcloud auth activate-service-account --key-file=${GCP_SA_JSON}
+                        gcloud config set project ${PROJECT}
+
+                        TEST_IP="${params.TEST_IP}"
+
+                        # Find instance name and zone by IP
+                        INSTANCE_INFO=\$(gcloud compute instances list \
+                            --filter="networkInterfaces[0].accessConfigs[0].natIP=${TEST_IP}" \
+                            --format="value(name,zone)")
+
+                        if [ -z "\$INSTANCE_INFO" ]; then
+                            echo "No instance found with IP \$TEST_IP. Skipping deletion."
+                            exit 0
+                        fi
+
+                        INSTANCE_NAME=\$(echo \$INSTANCE_INFO | awk '{print \$1}')
+                        INSTANCE_ZONE=\$(echo \$INSTANCE_INFO | awk '{print \$2}')
+
+                        echo "Deleting instance \$INSTANCE_NAME in zone \$INSTANCE_ZONE..."
+                        gcloud compute instances delete "\$INSTANCE_NAME" --zone="\$INSTANCE_ZONE" --quiet
+                        echo "Instance deleted successfully."
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
