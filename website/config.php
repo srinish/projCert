@@ -8,7 +8,7 @@
 function config($key = '')
 {
     $config = [
-        'name' => 'Simple PHP Website',
+        'name' => 'Simple PHP Website - Deployed Mala',
         'nav_menu' => [
             '' => 'Home',
             'content/about-us.php' => 'About Us',
