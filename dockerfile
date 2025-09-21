@@ -1,18 +1,27 @@
-# Use official NGINX image as base
-FROM nginx:alpine
+FROM php:8.2-fpm
 
-# Set working directory in container
-WORKDIR /usr/share/nginx/html
+# Install Nginx and utilities
+RUN apt-get update && apt-get install -y nginx supervisor && rm -rf /var/lib/apt/lists/*
 
-# Remove default NGINX static files
-RUN rm -rf ./*
+# Set working directory
+WORKDIR /var/www/html
 
-# Copy app content from repo into container
-COPY . .
+# Copy PHP app
+COPY website/ /var/www/html/
 
-# Expose port 80 for the web server
+# Set permissions
+RUN chown -R www-data:www-data /var/www/html && chmod -R 755 /var/www/html
+
+# Copy Nginx config
+COPY nginx.conf /etc/nginx/sites-enabled/default
+
+# Copy Supervisor config to manage PHP-FPM + Nginx
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+
+# Expose port 80
 EXPOSE 80
 
-# Start NGINX in foreground
-CMD ["nginx", "-g", "daemon off;"]
+# Start Supervisor
+CMD ["/usr/bin/supervisord", "-n"]
+
 # End of Dockerfile
