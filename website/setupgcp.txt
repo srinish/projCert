@@ -1,0 +1,229 @@
+High level flow
+• Developer pushes to GitHub master.
+• GitHub webhook triggers Jenkins.
+• Jenkins pipeline:
+	• Stage A: Provision a fresh test VM (slave/test-server).
+	• Stage B (Job-1): Install & configure Puppet agent on test-server.
+	• Stage C (Job-2): Run Ansible playbook from Jenkins (master) that installs Docker on test-server.
+	• Stage D (Job-3): On test-server, pull the PHP app, build the Docker image and run the container.
+	• On Job-3 failure: remove any running container on test-server (cleanup).
+• Optionally tag/push artifact to a registry and deploy to prod VM (or push a promotion step).
+
+//Export all variables
+
+export PROJECT_ID=devopscertification-472014
+export ZONE="us-central1-a"
+export REGION="us-central1"
+export JENKINS_MASTER_VM="jenkins-master"
+export JENKINS_SLAVE_VM="jenkins-slave-test"
+export JENKINS_USER= "jenkinsadmin"
+export TEST_PREFIX="test-server"
+export SA_NAME="jenkins-sa"
+export JENKINS_SSH_KEY_PATH="/var/lib/jenkins/.ssh/id_rsa"
+export USER="sureshfam25"
+
+
+// Setup GCP project and zone
+
+gcloud config set project $PROJECT_ID
+gcloud config set compute/zone $ZONE
+
+//Enable required googleapis
+
+gcloud services enable compute.googleapis.com \
+  iam.googleapis.com \
+  cloudresourcemanager.googleapis.com \
+  artifactregistry.googleapis.com
+
+//Create SA used by Jenkins to call gcloud
+
+gcloud iam service-accounts create $SA_NAME \
+  --display-name="Jenkins Service Account"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/compute.instanceAdmin.v1"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountUser"
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+
+  // Create and download a key for jenkins
+  gcloud iam service-accounts keys create ~/jenkins-sa-key.json \
+  --iam-account=${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com
+
+//Create vpc firewall rule (allow SSH, HTTP, jenkins ports and Docker remote)
+gcloud compute firewall-rules create allow-jenkins-ssh-http \
+  --project="$PROJECT_ID" \
+  --allow tcp:22,tcp:80,tcp:8080,tcp:50000 \
+  --description="Allow SSH, HTTP, Jenkins agent port" \
+  --direction=INGRESS
+
+//Create jenkins vm (ubuntu 22.04 LTS )
+
+gcloud compute instances create "$JENKINS_MASTER_VM" \
+  --zone "$ZONE" \
+  --machine-type=e2-standard-4\
+  --image-family=ubuntu-2204-lts \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=50GB \
+  --tags=jenkins-master
+
+  //SSH into the VM instance
+
+  sudo apt-get update -y
+  sudo apt-get upgrade -y
+  sudo apt-get install -y curl wget git python3 python3-pip apt-transport-https ca-certificates gnupg lsb-release unzip
+
+  // Install Java
+  sudo apt-get install -y openjdk-17-jdk
+  java -version
+
+  // Installing Docker
+
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+    | sudo tee /etc/apt/sources.list.d/docker.list
+  sudo apt-get update -y
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+  sudo usermod -aG docker $USER
+
+  Install gcloud SDK
+
+  # 0) quick safety: run as root or prefix with sudo
+  # 1) Clean any previous partial/cloud-google key attempts
+  sudo rm -f /usr/share/keyrings/cloud-google-archive-keyring.gpg \
+            /etc/apt/sources.list.d/google-cloud-sdk.list
+
+  # 2) Ensure required packages for apt over HTTPS and gpg are present
+  sudo apt-get update
+  sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release apt-transport-https
+
+  # 3) Download Google's apt signing key to a temp file and inspect it (detects HTML error pages)
+  curl -fsSL -o /tmp/cloud-sdk-key.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg || { echo "curl failed"; exit 1; }
+  echo "----- head of downloaded key file -----"
+  head -n 5 /tmp/cloud-sdk-key.gpg
+  echo "--------------------------------------"
+
+  # 4) Convert (dearmor) into a keyring trusted by apt
+  sudo gpg --dearmor -o /usr/share/keyrings/cloud-google-archive-keyring.gpg /tmp/cloud-sdk-key.gpg \
+    || { echo "gpg --dearmor failed"; exit 1; }
+
+  # 5) Create the apt source file using signed-by that points to the keyring
+  echo "deb [signed-by=/usr/share/keyrings/cloud-google-archive-keyring.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
+    | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null
+
+  # 6) Ensure correct ownership/permissions so apt can read the keyring
+  sudo chown root:root /usr/share/keyrings/cloud-google-archive-keyring.gpg
+  sudo chmod 0644 /usr/share/keyrings/cloud-google-archive-keyring.gpg
+
+  # 7) Remove any stale apt lists for that host and update
+  sudo rm -f /var/lib/apt/lists/*packages.cloud.google.com* || true
+  sudo apt-get update 2>&1 | tee /tmp/apt-update-cloudsdk.log
+
+  # 8) If update succeeded, install the SDK
+  if ! grep -i "NO_PUBKEY" /tmp/apt-update-cloudsdk.log >/dev/null 2>&1; then
+    sudo apt-get install -y google-cloud-sdk
+  else
+    echo "apt update reported NO_PUBKEY; showing relevant lines:"
+    grep -i "NO_PUBKEY" /tmp/apt-update-cloudsdk.log || true
+    echo "If you see HTML or an error in /tmp/cloud-sdk-key.gpg head output, check network/proxy."
+    exit 1
+  fi
+
+  # 9) show installed gcloud version
+  gcloud --version || true
+
+
+  // Install Jenkins
+
+  // Install prerequisites
+  sudo apt-get update
+  sudo apt-get install -y curl gnupg fontconfig openjdk-17-jre
+
+  // Clean up any old/broken Jenkins sources or keys
+  sudo rm -f /etc/apt/sources.list.d/jenkins.list
+  sudo rm -f /usr/share/keyrings/jenkins-keyring.gpg
+  sudo rm -f /etc/apt/trusted.gpg.d/jenkins.gpg
+
+  // Download and install the Jenkins repo key
+  curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | \
+    sudo gpg --dearmor -o /usr/share/keyrings/jenkins-keyring.gpg
+
+  // Add the Jenkins apt repo with signed-by
+  echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.gpg] https://pkg.jenkins.io/debian-stable binary/" | \
+    sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
+
+  // Update package list
+  sudo apt-get update
+
+  // Install Jenkins
+  sudo apt-get install -y jenkins
+
+  // Test installation
+  systemctl status jenkins
+
+  // Secure the Initial admin pwd
+  sudo cat /var/lib/jenkins/secrets/initialAdminPassword
+
+  //Install Ansible
+
+  sudo pip3 install ansible
+  # verify
+  ansible --version
+
+  //Create JENKINS SSH keys
+  sudo -i -u jenkins bash <<'EOF'
+  mkdir -p ~/.ssh
+  ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa -N "" -q
+  chmod 600 ~/.ssh/id_rsa
+  chmod 644 ~/.ssh/id_rsa.pub
+  EOF
+  # Print public key to copy into new VM's authorized_keys
+  sudo cat /var/lib/jenkins/.ssh/id_rsa.pub
+
+  //Add jenkins user to docker group
+  sudo usermod -aG docker jenkins
+  sudo systemctl restart jenkins
+
+  //Configure jenkins initial setup
+  http://externalip:8080/
+
+  Use the initial admin password when prompted
+  Select "Install Suggested Plugins" when prompted
+
+  Configure Admin user
+  username: jenkinsadmin
+  password: password
+
+  Select "Manage Jenkins"
+  Select "Credentials"
+
+  1. Add the GCP service account JSON as a secret File
+    Manage Jenkins → Manage Credentials → (global) → Add Credentials.
+    Kind: Secret file.
+    File: upload your jenkins-sa-key.json file (the one you downloaded from GCP).
+    ID: gcp-sa-key
+    Description: GCP service account key for provisioning VMs
+    Click OK.
+  2. Add the SSH private key with username
+      In the jenkins master vm
+      sudo cat /var/lib/jenkins/.ssh/id_rsa. (get the private key)
+      - Username - jenkins
+      - Add the private key
+      - ID = jenkins-ssh-key
+  3. Create a access token in github where project is managed
+     Copy the token value and save it
+     Add third credential as secret text
+     ID - github-token
+     Copy the saved secret token from github
+
+     Create the Jenkins pipeline jobs - Job0, Job1, Job2, Job3 and Job4
+     Build the Job0 or Perform a checkin in github job.
+     When all the jobs successfully run.
+     Go the gcp vm instances, copy the externalip of the test server
+     http://ExternalIP-TestServer:80/  will launch the PHP application.
