@@ -1,0 +1,55 @@
+pipeline {
+  agent any
+  environment {
+    SSH_CRED_ID = "jenkins-ssh-key"
+  }
+  parameters {
+    string(name: 'TEST_IP', defaultValue: '', description: 'Test Server Public IP')
+  }
+  stages {
+
+    stage('Install Puppet Agent') {
+      steps {
+        script {
+            sshagent (credentials: [SSH_CRED_ID]) {
+                sh """
+                ssh -o StrictHostKeyChecking=no jenkins@${params.TEST_IP} 'bash -s' <<'EOF'
+                  set -e
+
+                  echo ">>> Waiting for apt locks to be released..."
+                  while sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+                        sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+                        sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+                      echo "apt is busy, sleeping..."
+                      sleep 5
+                  done
+
+                  echo ">>> Updating apt and installing Puppet agent..."
+                  sudo apt-get update -y
+                  sudo apt-get install -y wget
+
+                  wget https://apt.puppet.com/puppet7-release-focal.deb
+                  sudo dpkg -i puppet7-release-focal.deb
+                  sudo apt-get update -y
+                  sudo apt-get install -y puppet-agent
+
+                  echo ">>> Puppet Agent installation complete."
+EOF
+                """
+                }
+            }
+      }
+    }
+  }
+  post {
+        success {
+            build job: 'Job2-Install-docker-via-ansible',
+                  parameters: [string(name: 'TEST_IP', value: params.TEST_IP)]
+        }
+        failure {
+            echo "Job2 failed, cleaning container..."
+            build job: 'Job4-Cleanup-Container-on-Failure',
+                 parameters: [string(name: 'TEST_IP', value: params.TEST_IP)]
+        }
+    }
+}
