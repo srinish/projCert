@@ -9,6 +9,11 @@ pipeline {
     STARTUP_PATH = "${WORKSPACE}/jenkins-slave-startup.sh"
   }
   stages {
+    stage('Clean Workspace') {
+            steps {
+                deleteDir() // deletes the current workspace before proceeding
+            }
+    }
     stage('Auth to GCP & create startup script') {
       steps {
         withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GCP_SA_JSON')]) {
